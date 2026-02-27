@@ -1,14 +1,16 @@
 """
 Unit tests for ocr/plate_ocr.py
 
-Tests cover preprocessing helpers and the normalize_plate_text function without
-requiring EasyOCR to be installed (OCR tests are skipped when easyocr is absent).
+Tests cover preprocessing helpers, the deskew utilities, character assembly,
+and the normalize_plate_text function without requiring PyTorch or a model
+file to be installed (OCR integration tests are skipped when unavailable).
 
 Run with:
     pytest tests/test_plate_ocr.py -v
 """
 
 import importlib
+import math
 import os
 import tempfile
 
@@ -34,19 +36,24 @@ def _make_plate_image(text: str = "30A12345", w: int = 200, h: int = 50) -> np.n
 
 
 # ---------------------------------------------------------------------------
-# Import under test (OCR functions that don't need easyocr)
+# Import under test (functions that don't need PyTorch / model file)
 # ---------------------------------------------------------------------------
 
 from ocr.plate_ocr import (
     preprocess_plate,
     normalize_plate_text,
     read_license_plate,
+    deskew_plate,
     _to_grayscale,
     _resize,
     _enhance_contrast,
     _denoise,
     _threshold,
     _deskew,
+    _change_contrast,
+    _rotate_image,
+    _compute_skew,
+    _assemble_plate_from_detections,
     _apply_positional_corrections,
     _try_recover_valid_plate,
 )
@@ -156,6 +163,101 @@ class TestPreprocessPlate:
 
 
 # ---------------------------------------------------------------------------
+# Deskew utilities (new in YOLOv5-based pipeline)
+# ---------------------------------------------------------------------------
+
+class TestChangeContrast:
+    def test_output_same_shape(self):
+        img = np.random.randint(0, 256, (64, 200, 3), dtype=np.uint8)
+        result = _change_contrast(img)
+        assert result.shape == img.shape
+
+    def test_output_dtype(self):
+        img = np.random.randint(0, 256, (64, 200, 3), dtype=np.uint8)
+        result = _change_contrast(img)
+        assert result.dtype == np.uint8
+
+
+class TestRotateImage:
+    def test_output_same_shape(self):
+        img = np.random.randint(0, 256, (64, 200, 3), dtype=np.uint8)
+        result = _rotate_image(img, 5.0)
+        assert result.shape == img.shape
+
+    def test_zero_angle_unchanged(self):
+        img = np.ones((64, 200, 3), dtype=np.uint8) * 128
+        result = _rotate_image(img, 0.0)
+        np.testing.assert_array_equal(result, img)
+
+
+class TestComputeSkew:
+    def test_returns_float(self):
+        img = _make_plate_image()
+        result = _compute_skew(img, center_threshold=0)
+        assert isinstance(result, float)
+
+    def test_blank_image_returns_numeric(self):
+        img = np.zeros((64, 200, 3), dtype=np.uint8)
+        result = _compute_skew(img, center_threshold=0)
+        assert isinstance(result, (int, float))
+
+
+class TestDeskewPlate:
+    def test_output_same_shape_no_contrast(self):
+        img = _make_plate_image()
+        result = deskew_plate(img, change_contrast=False, center_threshold=0)
+        assert result.shape == img.shape
+
+    def test_output_same_shape_with_contrast(self):
+        img = _make_plate_image()
+        result = deskew_plate(img, change_contrast=True, center_threshold=0)
+        assert result.shape == img.shape
+
+    def test_output_dtype(self):
+        img = _make_plate_image()
+        result = deskew_plate(img)
+        assert result.dtype == np.uint8
+
+
+# ---------------------------------------------------------------------------
+# Character assembly (_assemble_plate_from_detections)
+# ---------------------------------------------------------------------------
+
+class TestAssemblePlateFromDetections:
+    def _make_bb(self, label: str, x: float, y: float) -> list:
+        """Build a minimal bounding-box entry [xmin, ymin, xmax, ymax, conf, cls_id, label]."""
+        return [x, y, x + 10, y + 20, 0.9, 0, label]
+
+    def test_unknown_when_empty(self):
+        assert _assemble_plate_from_detections([]) == "unknown"
+
+    def test_unknown_when_too_few(self):
+        bbs = [self._make_bb(str(i), i * 12.0, 5.0) for i in range(6)]
+        assert _assemble_plate_from_detections(bbs) == "unknown"
+
+    def test_unknown_when_too_many(self):
+        bbs = [self._make_bb(str(i % 10), i * 12.0, 5.0) for i in range(11)]
+        assert _assemble_plate_from_detections(bbs) == "unknown"
+
+    def test_1_line_plate_sorted_by_x(self):
+        # 7 characters on a single line, provided deliberately out of order.
+        chars = [("A", 24), ("3", 0), ("4", 72), ("0", 12), ("2", 48), ("1", 36), ("3", 60)]
+        bbs = [self._make_bb(c, float(x), 5.0) for c, x in chars]
+        result = _assemble_plate_from_detections(bbs)
+        assert result == "30A1234"
+
+    def test_2_line_plate_dash_separator(self):
+        # 4 chars on row 1 (y=5) and 4 on row 2 (y=40).
+        row1 = [("3", 0, 5), ("0", 12, 5), ("A", 24, 5), ("1", 36, 5)]
+        row2 = [("2", 0, 40), ("3", 12, 40), ("4", 24, 40), ("5", 36, 40)]
+        bbs = [self._make_bb(c, float(x), float(y)) for c, x, y in row1 + row2]
+        result = _assemble_plate_from_detections(bbs)
+        assert "-" in result  # dash separator for 2-line format
+        parts = result.split("-")
+        assert len(parts) == 2
+
+
+# ---------------------------------------------------------------------------
 # Positional corrections
 # ---------------------------------------------------------------------------
 
@@ -228,7 +330,7 @@ class TestNormalizePlateText:
         assert len(result) > 0
 
     def test_oversized_plate_recovered(self):
-        # OCR sometimes inserts a noise character making the plate 10 chars.
+        # An extra detection sometimes makes the plate 10 chars.
         # normalize_plate_text should trim it back to a valid 9-char plate.
         result = normalize_plate_text("29A6133333")  # 10 chars
         assert len(result) <= 9
@@ -254,7 +356,7 @@ class TestTryRecoverValidPlate:
 
 
 # ---------------------------------------------------------------------------
-# read_license_plate – file-system integration (no easyocr required)
+# read_license_plate – file-system integration (no PyTorch / model required)
 # ---------------------------------------------------------------------------
 
 class TestReadLicensePlate:
@@ -269,8 +371,8 @@ class TestReadLicensePlate:
             read_license_plate(str(bad_file))
 
     @pytest.mark.skipif(
-        importlib.util.find_spec("easyocr") is None,
-        reason="easyocr not installed",
+        importlib.util.find_spec("torch") is None or not os.path.isfile("model/LP_ocr.pt"),
+        reason="torch not installed or model/LP_ocr.pt not present",
     )
     def test_returns_string_on_valid_image(self, tmp_path):
         img = _make_plate_image("30A12345")
