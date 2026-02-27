@@ -1,11 +1,26 @@
-# License Plate Recognition – OCR Module
+# License Plate Recognition – YOLOv5 OCR Module
 
-OCR pipeline for Vietnamese license plates.  
-Accepts a **pre-cropped** plate image and returns the recognised plate string
-(e.g. `30A12345`, `51H67890`).
+OCR pipeline for Vietnamese license plates using a **YOLOv5 model trained specifically on Vietnamese plate characters**.  
+Based on the approach from [trungdinh22/License-Plate-Recognition](https://github.com/trungdinh22/License-Plate-Recognition) which is more accurate than general-purpose OCR libraries for this domain.
 
-> YOLO detection is **not** included; drop your cropped plate images into
+Accepts a **pre-cropped** plate image and returns the recognised plate string  
+(e.g. `30A12345`, `51AB1234`, `29G133333`).
+
+> YOLO detection is **not** included in this module; drop your cropped plate images into  
 > `resources/` and feed them to `read_license_plate()`.
+
+---
+
+## How it works
+
+```
+Input image → deskew (×4 attempts) → YOLOv5 character detection → assemble → normalise → plate string
+```
+
+1. **Deskew** – Hough line detection corrects rotation (tries 4 combinations of contrast-enhancement and centre-threshold filtering).
+2. **Character detection** – A YOLOv5 model detects individual characters as bounding boxes.
+3. **Assembly** – Characters are sorted by X-coordinate; 2-line plates are detected via Y-coordinate analysis.
+4. **Normalise** – Positional letter↔digit corrections (`O→0`, `I→1`, `S→5`, …) are applied based on the expected Vietnamese plate structure.
 
 ---
 
@@ -15,9 +30,41 @@ Accepts a **pre-cropped** plate image and returns the recognised plate string
 pip install -r requirements.txt
 ```
 
-> **Note:** `opencv-python-headless` is used instead of `opencv-python` to
-> avoid display-library conflicts in server environments.  Replace with
-> `opencv-python` if you need GUI windows.
+> **Note:** `opencv-python-headless` is used instead of `opencv-python` to avoid  
+> display-library conflicts in server/CI environments. Replace with `opencv-python`  
+> if you need GUI windows (e.g. for `cv2.imshow`).
+
+---
+
+## Model setup
+
+This module requires a pretrained YOLOv5 OCR model. Two variants are available from  
+[trungdinh22/License-Plate-Recognition](https://github.com/trungdinh22/License-Plate-Recognition):
+
+| File | Size | Speed |
+|------|------|-------|
+| `LP_ocr.pt` | Larger | Higher accuracy |
+| `LP_ocr_nano_62.pt` | Smaller | Faster (~15–20 fps on CPU with 1 plate) |
+
+**Steps:**
+
+1. Download `LP_ocr.pt` (or `LP_ocr_nano_62.pt`) from the  
+   [Google Drive link in the reference repo](https://github.com/trungdinh22/License-Plate-Recognition).
+2. Create a `model/` directory in the project root and place the file there:
+
+```
+model/
+└── LP_ocr.pt
+```
+
+3. *(Optional)* Pass a custom path via the `model_path` argument:
+
+```python
+result = read_license_plate("resources/plate.jpg", model_path="model/LP_ocr_nano_62.pt")
+```
+
+> On first run, `torch.hub` will automatically download YOLOv5 weights/code  
+> (cached in `~/.cache/torch/hub`). Subsequent runs use the cache.
 
 ---
 
@@ -25,6 +72,8 @@ pip install -r requirements.txt
 
 ```
 .
+├── model/
+│   └── LP_ocr.pt            # pretrained YOLOv5 OCR model (download separately)
 ├── ocr/
 │   ├── __init__.py          # package exports
 │   └── plate_ocr.py         # full OCR pipeline
@@ -50,46 +99,51 @@ Or from the command line:
 
 ```bash
 python -m ocr.plate_ocr resources/plate.jpg
+# With a custom model path:
+python -m ocr.plate_ocr resources/plate.jpg model/LP_ocr_nano_62.pt
 ```
 
 ---
 
 ## API
 
-### `preprocess_plate(image: np.ndarray) -> np.ndarray`
+### `read_license_plate(image_path, model_path="model/LP_ocr.pt") → str`
 
-Applies the preprocessing pipeline to a NumPy image array:
+End-to-end helper: loads image → tries 4 deskew variants → YOLOv5 character
+detection → normalises → returns plate string.
 
-1. Grayscale conversion
-2. Resize (upscale to ≥ 64 px height)
-3. Contrast enhancement (CLAHE)
-4. Noise removal (median blur)
-5. Binarisation (Otsu's threshold)
-6. Deskew (rotation correction)
+- Raises `FileNotFoundError` if the file does not exist.
+- Raises `ValueError` if the file cannot be decoded as an image.
+- Returns `""` if no valid plate is detected.
 
-### `run_ocr(image: np.ndarray) -> str`
+### `deskew_plate(image, change_contrast=False, center_threshold=0) → np.ndarray`
 
-Runs EasyOCR on a preprocessed image and returns the raw concatenated text.
+Corrects skew in a BGR plate image using Hough line detection.  
+`change_contrast=True` applies CLAHE before skew estimation (helps on dark or  
+low-contrast plates). `center_threshold=1` ignores lines near the top edge  
+(useful for 2-line plates).
 
-**Why EasyOCR?**
-- Single `pip install`, no external binaries.
-- Decent alphanumeric accuracy out of the box.
-- Easy to switch to GPU (`gpu=True`) or add more language models.
+### `run_ocr(image, model_path="model/LP_ocr.pt") → str`
 
-### `normalize_plate_text(text: str) -> str`
+Runs the YOLOv5 character-detection model on a (deskewed) plate image and  
+returns the assembled plate string or `"unknown"` if fewer than 7 or more than  
+10 characters are detected.
+
+### `normalize_plate_text(text) → str`
 
 Cleans and standardises raw OCR output:
 
-- Strips non-alphanumeric characters.
-- Converts to uppercase.
-- Applies **positional** letter↔digit corrections (O→0, I→1, B→8, S→5, …)
-  based on the expected VN plate structure: `[2 digits][1-2 letters][4-5 digits]`.
-- Validates against Vietnamese plate format.
+- Strips non-alphanumeric characters; uppercases.
+- Applies **positional** letter↔digit corrections based on the expected VN plate  
+  structure: `[2 digits][1–2 letter series][4–5 digits]`.
+- Handles newer `[letter+digit series]` plates (e.g. `29G133333`).
+- If the string is > 9 characters, attempts recovery by removing one character.
 
-### `read_license_plate(image_path: str) -> str`
+### `preprocess_plate(image) → np.ndarray`
 
-End-to-end helper: loads image → preprocesses → OCR → normalises → returns
-plate string.
+Optional grayscale preprocessing pipeline (grayscale → resize → CLAHE →  
+median blur → Otsu threshold → deskew). Useful for visualisation or  
+non-YOLOv5 backends.
 
 ---
 
@@ -100,17 +154,20 @@ pip install pytest
 pytest tests/ -v
 ```
 
-Tests that call EasyOCR are automatically skipped when the library is not
-installed, so the preprocessing and normalisation tests always run.
+Tests covering preprocessing, deskew utilities, character assembly, and  
+normalisation run without PyTorch or the model file. The end-to-end  
+integration test is automatically skipped when `torch` is not installed  
+or `model/LP_ocr.pt` is absent.
 
 ---
 
-## Extending the pipeline
+## Performance tips
 
 | Goal | How |
-|---|---|
-| Improve accuracy on noisy images | Swap `_denoise` to `cv2.fastNlMeansDenoising` |
-| Handle uneven lighting | Replace Otsu with adaptive threshold in `_threshold` |
-| Use GPU | Pass `gpu=True` to `easyocr.Reader` in `_get_reader` |
-| Try PaddleOCR | Replace `run_ocr` body with PaddleOCR inference call |
-| Add Vietnamese characters | Add `"vi"` to the EasyOCR language list |
+|------|-----|
+| Faster inference | Use `LP_ocr_nano_62.pt` instead of `LP_ocr.pt` |
+| GPU acceleration | Install CUDA-enabled PyTorch; model runs on GPU automatically |
+| Batch processing | Call `run_ocr` directly and reuse the cached model (`_get_ocr_model()`) |
+| Noisy / dark plates | Pass `change_contrast=True` to `deskew_plate` |
+| 2-line plates | The pipeline handles them automatically via Y-coordinate analysis |
+
