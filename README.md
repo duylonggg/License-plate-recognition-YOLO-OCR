@@ -26,13 +26,27 @@ Input image → deskew (×4 attempts) → YOLOv5 character detection → assembl
 
 ## Installation
 
+It is strongly recommended to use a **virtual environment** to avoid dependency conflicts (especially with NumPy versions).
+
 ```bash
+# Create and activate a virtual environment
+python -m venv venv
+
+# Windows
+venv\Scripts\activate
+
+# macOS / Linux
+source venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
 > **Note:** `opencv-python-headless` is used instead of `opencv-python` to avoid  
 > display-library conflicts in server/CI environments. Replace with `opencv-python`  
-> if you need GUI windows (e.g. for `cv2.imshow`).
+> if you need GUI windows (e.g. for `cv2.imshow`).  
+> `numpy` is pinned to `<2.0` because some compiled dependencies are not yet  
+> compatible with NumPy 2.x.
 
 ---
 
