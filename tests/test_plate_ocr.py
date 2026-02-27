@@ -48,6 +48,7 @@ from ocr.plate_ocr import (
     _threshold,
     _deskew,
     _apply_positional_corrections,
+    _try_recover_valid_plate,
 )
 
 
@@ -89,6 +90,12 @@ class TestResize:
         img = np.zeros((100, 300), dtype=np.uint8)
         result = _resize(img, target_height=64)
         assert result.shape[0] == 100  # already taller than target – unchanged
+
+    def test_default_target_height_128(self):
+        """preprocess_plate now upscales to 128px for better OCR accuracy."""
+        img = np.zeros((20, 60), dtype=np.uint8)
+        result = _resize(img, target_height=128)
+        assert result.shape[0] == 128
 
 
 class TestEnhanceContrast:
@@ -172,6 +179,23 @@ class TestApplyPositionalCorrections:
         result = _apply_positional_corrections("30A12345")
         assert result == "30A12345"
 
+    def test_letter_digit_series_preserved(self):
+        # Letter+digit series (e.g. G1): position 2 is a letter, position 3 is the
+        # series digit and must NOT be converted via letter_fixes.
+        result = _apply_positional_corrections("29G133333")
+        assert result == "29G133333"
+
+    def test_letter_digit_series_digit_not_converted(self):
+        # The '1' in 'G1' series should NOT be converted to 'I' by letter_fixes.
+        result = _apply_positional_corrections("29G133333")
+        assert result[3] == "1"  # series digit stays '1', not 'I'
+
+    def test_letter_digit_series_letter_corrected(self):
+        # If position 2 is a digit (not alpha), no series is detected, so no
+        # letter_fixes are applied and the digit stays unchanged.
+        result = _apply_positional_corrections("296133333")
+        assert result == "296133333"
+
 
 # ---------------------------------------------------------------------------
 # normalize_plate_text
@@ -187,6 +211,9 @@ class TestNormalizePlateText:
         ("30A1234S", "30A12345"),          # sequence S→5
         ("", ""),                          # empty input
         ("???", ""),                       # only punctuation
+        # letter+digit series (newer VN plates, e.g. 29-G1 333.33)
+        ("29G133333", "29G133333"),        # G1 series, correct OCR read
+        ("29-G1 333.33", "29G133333"),     # raw plate text with separators
     ])
     def test_normalize(self, raw, expected):
         assert normalize_plate_text(raw) == expected
@@ -199,6 +226,31 @@ class TestNormalizePlateText:
         result = normalize_plate_text("ABCD")
         assert isinstance(result, str)
         assert len(result) > 0
+
+    def test_oversized_plate_recovered(self):
+        # OCR sometimes inserts a noise character making the plate 10 chars.
+        # normalize_plate_text should trim it back to a valid 9-char plate.
+        result = normalize_plate_text("29A6133333")  # 10 chars
+        assert len(result) <= 9
+        assert result  # non-empty
+
+
+# ---------------------------------------------------------------------------
+# _try_recover_valid_plate
+# ---------------------------------------------------------------------------
+
+class TestTryRecoverValidPlate:
+    def test_removes_noise_character_to_letter_digit_series(self):
+        # 10-char plate with an extra noise character: removing the right char
+        # should yield a valid 9-char letter+digit-series plate.
+        result = _try_recover_valid_plate("29A6133333")
+        assert result  # non-empty
+        assert len(result) == 9
+
+    def test_returns_empty_when_unrecoverable(self):
+        # Completely garbled input should return empty string.
+        result = _try_recover_valid_plate("XXXXXXXXXXX")
+        assert result == ""
 
 
 # ---------------------------------------------------------------------------

@@ -145,7 +145,7 @@ def preprocess_plate(image: np.ndarray) -> np.ndarray:
         Preprocessed grayscale binary image (NumPy array, dtype uint8).
     """
     img = _to_grayscale(image)
-    img = _resize(img, target_height=64)
+    img = _resize(img, target_height=128)
     img = _enhance_contrast(img)
     img = _denoise(img)
     img = _threshold(img)
@@ -202,12 +202,12 @@ _OCR_CORRECTIONS = {
     "T": "7",  # letter T → digit 7  (less common but observed)
 }
 
-# Vietnamese license plate format patterns (simplified):
-#   Standard (two-row or one-row, 1-letter series): [2 digits][1 letter][4-5 digits]  e.g. 30A12345
-#   One-row (2-letter series):                      [2 digits][2 letters][4-5 digits] e.g. 51AB1234
-#   Both variants are matched by the regex below ([A-Z]{1,2}).
+# Vietnamese license plate format patterns:
+#   Standard (1-letter series):          [2 digits][1 letter][4-5 digits]       e.g. 30A12345
+#   One-row (2-letter series):           [2 digits][2 letters][4-5 digits]      e.g. 51AB1234
+#   Newer (letter+digit series, e.g. G1):[2 digits][1 letter][1 digit][5 digits] e.g. 29G133333
 _VN_PLATE_PATTERN = re.compile(
-    r"^(\d{2})([A-Z]{1,2})(\d{4,5})$"
+    r"^(\d{2})([A-Z]\d|[A-Z]{1,2})(\d{4,5})$"
 )
 
 
@@ -216,9 +216,13 @@ def _apply_positional_corrections(plate: str) -> str:
     Apply letter↔digit substitutions based on position in the plate string.
 
     Vietnamese plates follow: <2-digit province code> <1-2 letter series> <4-5 digit number>
+    Newer plates also use:    <2-digit province code> <1 letter + 1 digit series> <5 digit number>
+    e.g. 29G133333 where 'G1' is the series code.
 
     - Province code (positions 0-1): must be digits → convert look-alike letters.
     - Series (positions 2-3 or 2): must be letters → convert look-alike digits.
+      Exception: in a letter+digit series the character at position 3 is a digit and
+      is left unchanged.
     - Sequence (last 4-5 chars): must be digits → convert look-alike letters.
     """
     # Digit look-alikes (used in digit positions)
@@ -234,22 +238,45 @@ def _apply_positional_corrections(plate: str) -> str:
         chars[i] = digit_fixes.get(chars[i], chars[i])
 
     # Determine series length heuristically.
-    # After the 2-digit province code the series is 1-2 letters.
+    # After the 2-digit province code the series is:
+    #   - 1-2 letters (classic format), or
+    #   - 1 letter followed by 1 digit (newer letter+digit series, total plate length 9).
     series_end = 2
     if length > 2 and chars[2].isalpha():
         series_end = 3
         if length > 3 and chars[3].isalpha():
-            series_end = 4
+            series_end = 4  # 2-letter series (e.g. AB)
+        elif length > 3 and chars[3].isdigit() and length == 9:
+            series_end = 4  # letter+digit series (e.g. G1): position 3 is the series digit
 
-    # Series characters must be letters.
+    # Series characters must be letters; the digit part of a letter+digit series stays as-is.
     for i in range(2, series_end):
-        chars[i] = letter_fixes.get(chars[i], chars[i])
+        is_series_digit = (series_end == 4 and i == 3 and chars[i].isdigit())
+        if not is_series_digit:
+            chars[i] = letter_fixes.get(chars[i], chars[i])
 
     # Sequence (after the series) must be digits.
     for i in range(series_end, length):
         chars[i] = digit_fixes.get(chars[i], chars[i])
 
     return "".join(chars)
+
+
+def _try_recover_valid_plate(plate: str) -> str:
+    """
+    Attempt to recover a valid plate string from one that is too long (likely
+    caused by OCR inserting one extra character due to noise or a separator
+    artefact).  Tries removing each character in turn and returns the first
+    candidate that, after positional corrections, matches the expected
+    Vietnamese plate pattern.  Returns an empty string if no valid candidate
+    is found.
+    """
+    for i in range(len(plate)):
+        candidate = plate[:i] + plate[i + 1:]
+        candidate = _apply_positional_corrections(candidate)
+        if _VN_PLATE_PATTERN.match(candidate):
+            return candidate
+    return ""
 
 
 def normalize_plate_text(text: str) -> str:
@@ -261,6 +288,8 @@ def normalize_plate_text(text: str) -> str:
       2. Apply positional letter↔digit corrections.
       3. Validate against the expected VN plate format (optional – returns best
          guess even if it does not match, so the caller can decide).
+      4. If the string is too long (> 9 chars), attempt recovery by removing one
+         character at a time until a valid format is found.
 
     Args:
         text: Raw OCR string (may contain spaces, punctuation, noise).
@@ -281,6 +310,14 @@ def normalize_plate_text(text: str) -> str:
     # 3. Validate format (informational – does not discard non-matching results).
     if _VN_PLATE_PATTERN.match(corrected):
         return corrected  # well-formed plate
+
+    # 4. If too long (> 9 chars), try removing one character to recover a valid plate.
+    #    This handles cases where OCR inserts an extra character from noise or a
+    #    plate-separator artefact (e.g. a dash or dot read as '1').
+    if len(corrected) > 9:
+        recovered = _try_recover_valid_plate(corrected)
+        if recovered:
+            return recovered
 
     # Return best-effort result even when format doesn't match perfectly.
     return corrected
